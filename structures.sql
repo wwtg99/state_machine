@@ -206,13 +206,16 @@ BEGIN
 END;
 $BODY$ LANGUAGE plpgsql;
 
-CREATE OR REPLACE FUNCTION transfer_state() RETURNS TRIGGER 
+CREATE OR REPLACE FUNCTION tp_transfer_state() RETURNS TRIGGER 
 AS $BODY$
 DECLARE
 	_state task_state_type;
 	_func TEXT;
 	_res BOOL;
 BEGIN
+	IF NEW.state = 'Queued' THEN
+		RETURN NEW;
+	END IF;
 	_state := get_state(NEW.object, NEW.object_id, NEW.task_id, NEW.protocol_id);
 	IF _state IS NULL THEN
 		_state := 'Queued'::task_state_type;
@@ -240,4 +243,40 @@ $BODY$ LANGUAGE plpgsql
 SECURITY DEFINER;
 
 CREATE TRIGGER tg_task_log BEFORE INSERT ON task_log 
-FOR EACH ROW EXECUTE PROCEDURE transfer_state();
+FOR EACH ROW EXECUTE PROCEDURE tp_transfer_state();
+
+CREATE OR REPLACE FUNCTION tp_change() RETURNS TRIGGER AS $BODY$
+DECLARE
+	
+BEGIN
+	CASE TG_OP
+	WHEN 'INSERT' THEN
+		NEW.created_at := now();
+		NEW.updated_at := now();
+		RETURN NEW;
+	WHEN 'UPDATE' THEN
+		NEW.created_at := OLD.created_at;
+		NEW.updated_at := now();
+		RETURN NEW;
+	ELSE
+		RETURN NULL;
+	END CASE;
+END;
+$BODY$ LANGUAGE plpgsql
+SECURITY DEFINER;
+
+CREATE TRIGGER tg_tasks BEFORE INSERT OR UPDATE ON tasks 
+FOR EACH ROW EXECUTE PROCEDURE tp_change();
+
+CREATE TRIGGER tg_protocols BEFORE INSERT OR UPDATE ON protocols 
+FOR EACH ROW EXECUTE PROCEDURE tp_change();
+
+---------
+--views--
+---------
+
+CREATE OR REPLACE VIEW view_protocols AS 
+SELECT protocol_id, p.label AS protocol, p.task_id, t.label AS task, 
+version, priority, t.descr AS task_descr, p.descr AS protocol_descr, 
+p.created_at, p.updated_at, p.deleted_at 
+FROM protocols AS p JOIN tasks AS t ON p.task_id = t.task_id;
