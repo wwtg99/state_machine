@@ -10,17 +10,20 @@ ENUM ('Queued', 'In Progress', 'Completed',
 --tables--
 ----------
 
+--task list
 CREATE TABLE tasks (
 	task_id INT PRIMARY KEY,
 	label TEXT NOT NULL UNIQUE,
 	descr TEXT,
-	check_func TEXT, --function(object, object_id, task_id) return bool
+	check_func TEXT, --function(object, object_id, task_id) return bool, check in start task
 	params JSONB,
 	created_at TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT now(),
 	updated_at TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT now(),
 	deleted_at TIMESTAMP WITH TIME ZONE
 );
 
+
+--protocol list
 CREATE TABLE protocols (
 	protocol_id INT PRIMARY KEY,
 	task_id INT REFERENCES tasks (task_id) NOT NULL,
@@ -28,7 +31,7 @@ CREATE TABLE protocols (
 	version TEXT NOT NULL,
 	priority INT NOT NULL DEFAULT 100,
 	descr TEXT,
-	check_func TEXT, --function(object, object_id, task_id, protocol_id) return bool
+	check_func TEXT, --function(object, object_id, task_id, protocol_id) return bool, check in start task
 	params JSONB,
 	created_at TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT now(),
 	updated_at TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT now(),
@@ -36,6 +39,7 @@ CREATE TABLE protocols (
 	UNIQUE (task_id, priority)
 );
 
+--task transition tree
 CREATE TABLE task_tree (
 	id SERIAL PRIMARY KEY,
 	from_task_id INT REFERENCES tasks (task_id) NOT NULL,
@@ -44,6 +48,7 @@ CREATE TABLE task_tree (
 	to_protocol_id INT REFERENCES protocols (protocol_id)
 );
 
+--task log
 CREATE TABLE task_log (
 	id SERIAL PRIMARY KEY,
 	task_id INT NOT NULL REFERENCES tasks (task_id),
@@ -56,6 +61,7 @@ CREATE TABLE task_log (
 	created_by TEXT NOT NULL
 );
 
+--task queue list
 CREATE TABLE task_queue (
 	id SERIAL PRIMARY KEY,
 	task_id INT NOT NULL REFERENCES tasks (task_id),
@@ -66,19 +72,21 @@ CREATE TABLE task_queue (
 	created_at TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT now()
 );
 
+--task state transition tree
 CREATE TABLE state_transfer (
 	id SERIAL PRIMARY KEY,
 	task_id INT NOT NULL REFERENCES tasks (task_id),
 	protocol_id INT REFERENCES protocols (protocol_id),
 	from_state task_state_type NOT NULL,
 	to_state task_state_type NOT NULL,
-	check_func TEXT -- function (current_state, task_log) return bool
+	check_func TEXT -- function (current_state, task_log) return bool, check in state transition
 );
 
 -------------
 --functions--
 -------------
 
+--get current state of object in task (protocol)
 CREATE OR REPLACE FUNCTION get_state(in_object TEXT, in_object_id TEXT, 
 	in_task_id INT, in_protocol_id INT DEFAULT NULL) 
 RETURNS task_state_type AS $BODY$
@@ -103,6 +111,36 @@ END;
 $BODY$ LANGUAGE plpgsql
 SECURITY DEFINER;
 
+--check whether object is in specific state for task (protocol)
+CREATE OR REPLACE FUNCTION is_in_state(in_state task_state_type, in_object TEXT, 
+	in_object_id TEXT, in_task_id INT, in_protocol_id INT DEFAULT NULL) 
+RETURNS BOOL AS $BODY$
+DECLARE
+	_state task_state_type;
+BEGIN
+	_state := get_state(in_object, in_object_id, in_task_id, in_protocol_id);
+	IF _state = in_state THEN
+		RETURN TRUE;
+	END IF;
+	RETURN FALSE;
+END;
+$BODY$ LANGUAGE plpgsql
+SECURITY DEFINER;
+
+--check whether object is completed for task (protocol)
+CREATE OR REPLACE FUNCTION is_completed(in_object TEXT, in_object_id TEXT, 
+	in_task_id INT, in_protocol_id INT DEFAULT NULL) 
+RETURNS BOOL AS $BODY$
+DECLARE
+	
+BEGIN
+	RETURN is_in_state('Completed'::task_state_type, in_object, in_object_id, 
+		in_task_id, in_protocol_id);
+END;
+$BODY$ LANGUAGE plpgsql
+SECURITY DEFINER;
+
+--check whether object is ready for task (protocol)
 CREATE OR REPLACE FUNCTION is_ready(in_object TEXT, in_object_id TEXT, 
 	in_task_id INT, in_protocol_id INT DEFAULT NULL) 
 RETURNS BOOL AS $BODY$
@@ -129,8 +167,7 @@ BEGIN
 		END IF;
 	END IF;
 	--check pre task and protocol
-	_state := get_state(in_object, in_object_id, _pre_task.from_task_id, _pre_task.from_protocol_id);
-	IF _state = 'Completed' THEN
+	IF is_completed(in_object, in_object_id, _pre_task.from_task_id, _pre_task.from_protocol_id) THEN
 		RETURN is_ready(in_object, in_object_id, _pre_task.from_task_id, _pre_task.from_protocol_id);
 	END IF;
 	RETURN FALSE;
@@ -138,21 +175,7 @@ END;
 $BODY$ LANGUAGE plpgsql
 SECURITY DEFINER;
 
-CREATE OR REPLACE FUNCTION is_completed(in_object TEXT, in_object_id TEXT, 
-	in_task_id INT, in_protocol_id INT DEFAULT NULL) 
-RETURNS BOOL AS $BODY$
-DECLARE
-	_state task_state_type;
-BEGIN
-	_state := get_state(in_object, in_object_id, in_task_id, in_protocol_id);
-	IF _state = 'Completed' THEN
-		RETURN TRUE;
-	END IF;
-	RETURN FALSE;
-END;
-$BODY$ LANGUAGE plpgsql
-SECURITY DEFINER;
-
+--start task from task queue with dependence and func check
 CREATE OR REPLACE FUNCTION start_task(in_object TEXT, in_object_id TEXT, 
 	in_task_id INT, in_protocol_id INT, in_user TEXT, in_params JSONB DEFAULT NULL) 
 RETURNS BIGINT AS $BODY$
@@ -174,7 +197,7 @@ BEGIN
 			RETURN NULL;
 		END IF;
 	END IF;
-	SELECT is_ready(in_object, in_object_id, in_task_id, in_protocol_id) INTO _ready;
+	_ready := is_ready(in_object, in_object_id, in_task_id, in_protocol_id);
 	IF NOT _ready THEN
 		RETURN NULL;
 	END IF;
@@ -206,6 +229,12 @@ BEGIN
 END;
 $BODY$ LANGUAGE plpgsql;
 
+
+------------
+--triggers--
+------------
+
+--check state transfer before task state transition
 CREATE OR REPLACE FUNCTION tp_transfer_state() RETURNS TRIGGER 
 AS $BODY$
 DECLARE
@@ -220,6 +249,7 @@ BEGIN
 	IF _state IS NULL THEN
 		_state := 'Queued'::task_state_type;
 	END IF;
+	--deny state transition if not specified in state_transfer
 	SELECT check_func INTO _func FROM state_transfer 
 	WHERE task_id = NEW.task_id AND protocol_id = NEW.protocol_id 
 	AND from_state = _state AND to_state = NEW.state;
@@ -231,6 +261,7 @@ BEGIN
 			RETURN NULL;
 		END IF;
 	END IF;
+	--check transition func if exists
 	IF _func IS NOT NULL THEN
 		EXECUTE 'SELECT ' || _func || '($1, $2)' INTO _res USING _state, NEW::task_log;
 		IF NOT _res THEN
@@ -245,6 +276,7 @@ SECURITY DEFINER;
 CREATE TRIGGER tg_task_log BEFORE INSERT ON task_log 
 FOR EACH ROW EXECUTE PROCEDURE tp_transfer_state();
 
+--ensure created_at and updated_at in insert and update
 CREATE OR REPLACE FUNCTION tp_change() RETURNS TRIGGER AS $BODY$
 DECLARE
 	
